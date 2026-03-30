@@ -61,6 +61,7 @@ type MockCluster struct {
 	nodes       map[int]*ConsensusModule
 	dead        map[int]bool
 	brokenLinks map[int]map[int]bool
+	ready       chan struct{}
 }
 
 func NewMockCluster(n int) *MockCluster {
@@ -68,9 +69,12 @@ func NewMockCluster(n int) *MockCluster {
 		nodes:       make(map[int]*ConsensusModule),
 		dead:        make(map[int]bool),
 		brokenLinks: make(map[int]map[int]bool),
+		ready:       make(chan struct{}),
 	}
 
 	for i := range n {
+		mc.brokenLinks[i] = make(map[int]bool)
+
 		var peerIds []int
 		for j := range n {
 			if i != j {
@@ -79,7 +83,13 @@ func NewMockCluster(n int) *MockCluster {
 		}
 		mc.nodes[i] = NewConsensusModule(i, peerIds, mc, NewMockStorage(), make(chan ApplyMsg, 100))
 	}
+
+	close(mc.ready)
 	return mc
+}
+
+func (mc *MockCluster) waitReady() {
+	<-mc.ready
 }
 
 func (mc *MockCluster) Shutdown() {
@@ -116,6 +126,8 @@ func (mc *MockCluster) ReviveNode(id int) {
 }
 
 func (mc *MockCluster) SendRequestVote(peerId int, args RequestVoteArgs, reply *RequestVoteReply) error {
+	mc.waitReady()
+
 	mc.mu.Lock()
 	dead := mc.dead[peerId] || mc.dead[args.CandidateID]
 	broken := mc.brokenLinks[args.CandidateID][peerId] || mc.brokenLinks[peerId][args.CandidateID]
@@ -130,6 +142,8 @@ func (mc *MockCluster) SendRequestVote(peerId int, args RequestVoteArgs, reply *
 }
 
 func (mc *MockCluster) SendAppendEntries(peerId int, args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	mc.waitReady()
+
 	mc.mu.Lock()
 	dead := mc.dead[peerId] || mc.dead[args.LeaderID]
 	broken := mc.brokenLinks[args.LeaderID][peerId] || mc.brokenLinks[peerId][args.LeaderID]
@@ -144,6 +158,8 @@ func (mc *MockCluster) SendAppendEntries(peerId int, args AppendEntriesArgs, rep
 }
 
 func (mc *MockCluster) SendInstallSnapshot(peerId int, args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	mc.waitReady()
+
 	mc.mu.Lock()
 	dead := mc.dead[peerId] || mc.dead[args.LeaderId]
 	broken := mc.brokenLinks[args.LeaderId][peerId] || mc.brokenLinks[peerId][args.LeaderId]
@@ -158,6 +174,8 @@ func (mc *MockCluster) SendInstallSnapshot(peerId int, args InstallSnapshotArgs,
 }
 
 func (mc *MockCluster) CheckSingleLeader() (int, int) {
+	mc.waitReady()
+
 	leader, term := -1, -1
 	for i := 0; i < len(mc.nodes); i++ {
 		mc.mu.Lock()
