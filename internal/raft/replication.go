@@ -7,6 +7,7 @@ import (
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
 	cm.leaderId = cm.id
+	cm.recentAcks = make(map[int]time.Time)
 	cm.dlog("Became LEADER for term %d", cm.currentTerm)
 
 	lastLogIndex := cm.lastIncludedIndex + len(cm.log) - 1
@@ -176,6 +177,7 @@ func (cm *ConsensusModule) advanceCommitIndex() {
 
 		if matchCount*2 > len(cm.peerIds)+1 {
 			cm.commitIndex.Store(int64(i))
+			cm.persistMeta()
 			cm.applyCond.Broadcast()
 			return
 		}

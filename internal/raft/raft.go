@@ -44,6 +44,7 @@ type Snapshot struct {
 type persistentMeta struct {
 	CurrentTerm       int
 	VotedFor          int
+	CommitIndex       int
 	LastIncludedIndex int
 	LastIncludedTerm  int
 }
@@ -189,6 +190,7 @@ func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.currentTerm = term
 	cm.votedFor = -1
 	cm.leaderId = -1
+	cm.recentAcks = make(map[int]time.Time)
 	cm.persistMeta()
 	for _, cond := range cm.replicationCond {
 		cond.Broadcast()
@@ -220,6 +222,7 @@ func (cm *ConsensusModule) Snapshot(index int, snapshot []byte) {
 	meta := persistentMeta{
 		CurrentTerm:       cm.currentTerm,
 		VotedFor:          cm.votedFor,
+		CommitIndex:       int(cm.commitIndex.Load()),
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
@@ -274,6 +277,7 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 	meta := persistentMeta{
 		CurrentTerm:       cm.currentTerm,
 		VotedFor:          cm.votedFor,
+		CommitIndex:       int(cm.commitIndex.Load()),
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
@@ -343,13 +347,13 @@ func NewConsensusModule(id int, peerIds []int, server Transporter, storage Stora
 	}
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
-		cm.commitIndex.Store(int64(cm.lastIncludedIndex))
 		cm.lastApplied.Store(int64(cm.lastIncludedIndex))
 		cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
 	} else {
 		cm.currentTerm = 0
 		cm.votedFor = -1
 		cm.log = []LogEntry{{Term: 0}}
+		cm.commitIndex.Store(0)
 		cm.lastIncludedIndex = 0
 		cm.lastIncludedTerm = 0
 	}
@@ -396,6 +400,7 @@ func (cm *ConsensusModule) persister() {
 		meta := persistentMeta{
 			CurrentTerm:       cm.currentTerm,
 			VotedFor:          cm.votedFor,
+			CommitIndex:       int(cm.commitIndex.Load()),
 			LastIncludedIndex: cm.lastIncludedIndex,
 			LastIncludedTerm:  cm.lastIncludedTerm,
 		}
@@ -441,6 +446,7 @@ func (cm *ConsensusModule) persistMeta() {
 	meta := persistentMeta{
 		CurrentTerm:       cm.currentTerm,
 		VotedFor:          cm.votedFor,
+		CommitIndex:       int(cm.commitIndex.Load()),
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
@@ -459,6 +465,7 @@ func (cm *ConsensusModule) restoreFromStorage() {
 		if err := dec.Decode(&meta); err == nil {
 			cm.currentTerm = meta.CurrentTerm
 			cm.votedFor = meta.VotedFor
+			cm.commitIndex.Store(int64(meta.CommitIndex))
 			cm.lastIncludedIndex = meta.LastIncludedIndex
 			cm.lastIncludedTerm = meta.LastIncludedTerm
 		}
@@ -470,6 +477,13 @@ func (cm *ConsensusModule) restoreFromStorage() {
 		if err := gob.NewDecoder(bytes.NewReader(logBytes)).Decode(&entry); err == nil {
 			cm.log = append(cm.log, entry)
 		}
+	}
+
+	maxCommitIndex := cm.lastIncludedIndex + len(cm.log) - 1
+	if int(cm.commitIndex.Load()) < cm.lastIncludedIndex {
+		cm.commitIndex.Store(int64(cm.lastIncludedIndex))
+	} else if int(cm.commitIndex.Load()) > maxCommitIndex {
+		cm.commitIndex.Store(int64(maxCommitIndex))
 	}
 
 	if len(snapData) > 0 {
@@ -593,6 +607,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	if args.LeaderCommit > int(cm.commitIndex.Load()) {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 		cm.commitIndex.Store(int64(min(args.LeaderCommit, lastNewEntryIndex)))
+		cm.persistMeta()
 		cm.applyCond.Broadcast()
 	}
 
@@ -697,4 +712,27 @@ func (cm *ConsensusModule) LinearizableRead() error {
 		return nil
 	}
 	return fmt.Errorf("leader lease expired")
+}
+
+func (cm *ConsensusModule) ReadBarrier() (int, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state != Leader {
+		return 0, fmt.Errorf("not leader")
+	}
+
+	validAcks := 1
+	now := time.Now()
+	for _, ackTime := range cm.recentAcks {
+		if now.Sub(ackTime) < 150*time.Millisecond {
+			validAcks++
+		}
+	}
+
+	if validAcks*2 <= len(cm.peerIds)+1 {
+		return 0, fmt.Errorf("leader lease expired")
+	}
+
+	return int(cm.commitIndex.Load()), nil
 }

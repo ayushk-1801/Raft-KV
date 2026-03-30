@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"flag"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ayushk-1801/raft-kv/internal/raft"
 	"github.com/ayushk-1801/raft-kv/internal/store"
@@ -121,7 +123,15 @@ func (s *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		if err := s.node.LinearizableRead(); err != nil {
+		readIndex, err := s.node.ReadBarrier()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := s.kv.WaitForApplyContext(ctx, readIndex); err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
@@ -159,7 +169,17 @@ func (s *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.kv.WaitForApply(index)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if err := s.kv.WaitForApplyContext(ctx, index); err != nil {
+		_, _, isLeader, _ := s.node.GetState()
+		if !isLeader {
+			http.Error(w, "Leadership lost before apply", http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusGatewayTimeout)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf("Applied at index %d", index)))
 }
