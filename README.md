@@ -89,9 +89,9 @@ go test -v ./internal/raft/...
 ```
 
 ## References
-- [Raft Consensus Algorithm](https://raft.github.io/raft.pdf)
-- [Linearizability and Consistency](https://jepsen.io/consistency/models/linearizable)
-- [Leader Leases (Paxos/Raft)](https://distributed-computing-musings.com/2019/02/leader-leases-in-distributed-systems/)
+- [Raft Consensus Algorithm Paper](https://raft.github.io/raft.pdf)
+- [The Secret Lives of Data](https://thesecretlivesofdata.com/raft/)
+- [Eli Bendersky's Blog](https://eli.thegreenplace.net/2020/implementing-raft-part-0-introduction/)
 
 ## License
 MIT
