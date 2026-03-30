@@ -13,10 +13,10 @@ func (cm *ConsensusModule) startLeader() {
 
 	for _, peerId := range cm.peerIds {
 		cm.nextIndex[peerId] = lastLogIndex + 1
-		cm.matchIndex[peerId] = 0
+		cm.matchIndex[peerId] = cm.lastIncludedIndex
+		go cm.replicator(peerId)
 	}
 
-	go cm.broadcastHeartbeats()
 	go cm.runHeartbeatTimer()
 }
 
@@ -25,138 +25,144 @@ func (cm *ConsensusModule) runHeartbeatTimer() {
 	defer ticker.Stop()
 
 	for !cm.isKilled() {
-		<-ticker.C
+		select {
+		case <-ticker.C:
+		case <-cm.triggerCh:
+		}
+
 		cm.mu.Lock()
 		if cm.state != Leader {
 			cm.mu.Unlock()
-			continue
+			return
+		}
+		for _, peerId := range cm.peerIds {
+			cm.replicationCond[peerId].Broadcast()
 		}
 		cm.mu.Unlock()
-		cm.broadcastHeartbeats()
 	}
 }
 
-func (cm *ConsensusModule) broadcastHeartbeats() {
+func (cm *ConsensusModule) replicator(peer int) {
 	cm.mu.Lock()
-	if cm.state != Leader {
-		cm.mu.Unlock()
-		return
-	}
+	defer cm.mu.Unlock()
+
 	savedTerm := cm.currentTerm
-	cm.mu.Unlock()
 
-	for _, peerId := range cm.peerIds {
-		go func(peer int) {
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
-			}
+	for !cm.isKilled() && cm.state == Leader && savedTerm == cm.currentTerm {
+		nextIdx := cm.nextIndex[peer]
 
-			nextIdx := cm.nextIndex[peer]
-
-			if nextIdx <= cm.lastIncludedIndex {
-				snapshotData, _ := cm.storage.Get("raft_snapshot")
-				args := InstallSnapshotArgs{
-					Term:              savedTerm,
-					LeaderId:          cm.id,
-					LastIncludedIndex: cm.lastIncludedIndex,
-					LastIncludedTerm:  cm.lastIncludedTerm,
-					Data:              snapshotData,
-				}
-				cm.mu.Unlock()
-
-				var reply InstallSnapshotReply
-				if err := cm.server.SendInstallSnapshot(peer, args, &reply); err == nil {
-					cm.mu.Lock()
-					defer cm.mu.Unlock()
-					if reply.Term > cm.currentTerm {
-						cm.currentTerm = reply.Term
-						cm.state = Follower
-						cm.votedFor = -1
-						cm.persistToStorage()
-						return
-					}
-					if cm.state == Leader && savedTerm == cm.currentTerm {
-						cm.matchIndex[peer] = max(cm.matchIndex[peer], args.LastIncludedIndex)
-						cm.nextIndex[peer] = cm.matchIndex[peer] + 1
-					}
-				}
-				return
-			}
-
-			prevLogIndex := nextIdx - 1
-			prevLogTerm := cm.lastIncludedTerm
-			if prevLogIndex > cm.lastIncludedIndex {
-				prevLogTerm = cm.log[prevLogIndex-cm.lastIncludedIndex].Term
-			}
-
-			entries := make([]LogEntry, len(cm.log[nextIdx-cm.lastIncludedIndex:]))
-			copy(entries, cm.log[nextIdx-cm.lastIncludedIndex:])
-
-			args := AppendEntriesArgs{
-				Term:         savedTerm,
-				LeaderID:     cm.id,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: cm.commitIndex,
+		if nextIdx <= cm.lastIncludedIndex {
+			_, snapshotData, _, _ := cm.storage.ReadState()
+			args := InstallSnapshotArgs{
+				Term:              savedTerm,
+				LeaderId:          cm.id,
+				LastIncludedIndex: cm.lastIncludedIndex,
+				LastIncludedTerm:  cm.lastIncludedTerm,
+				Data:              snapshotData,
 			}
 			cm.mu.Unlock()
 
-			var reply AppendEntriesReply
-			err := cm.server.SendAppendEntries(peer, args, &reply)
-			if err != nil {
-				return
-			}
+			var reply InstallSnapshotReply
+			err := cm.server.SendInstallSnapshot(peer, args, &reply)
 
 			cm.mu.Lock()
-			defer cm.mu.Unlock()
-
+			if cm.state != Leader || cm.currentTerm != savedTerm {
+				return
+			}
+			if err != nil {
+				cm.replicationCond[peer].Wait()
+				continue
+			}
 			if reply.Term > cm.currentTerm {
-				cm.currentTerm = reply.Term
-				cm.state = Follower
-				cm.votedFor = -1
-				cm.persistToStorage()
+				cm.becomeFollower(reply.Term)
 				return
 			}
+			cm.matchIndex[peer] = max(cm.matchIndex[peer], args.LastIncludedIndex)
+			cm.nextIndex[peer] = cm.matchIndex[peer] + 1
+			continue
+		}
 
-			if cm.state != Leader || savedTerm != cm.currentTerm {
-				return
+		prevLogIndex := nextIdx - 1
+		prevLogTerm := cm.lastIncludedTerm
+		if prevLogIndex > cm.lastIncludedIndex {
+			prevLogTerm = cm.log[prevLogIndex-cm.lastIncludedIndex].Term
+		}
+
+		lastLogIndex := cm.lastIncludedIndex + len(cm.log) - 1
+		var entries []LogEntry
+		if nextIdx <= lastLogIndex {
+			entries = make([]LogEntry, len(cm.log[nextIdx-cm.lastIncludedIndex:]))
+			copy(entries, cm.log[nextIdx-cm.lastIncludedIndex:])
+		}
+
+		args := AppendEntriesArgs{
+			Term:         savedTerm,
+			LeaderID:     cm.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      entries,
+			LeaderCommit: int(cm.commitIndex.Load()),
+		}
+		cm.mu.Unlock()
+
+		var reply AppendEntriesReply
+		err := cm.server.SendAppendEntries(peer, args, &reply)
+
+		cm.mu.Lock()
+		if cm.state != Leader || cm.currentTerm != savedTerm {
+			return
+		}
+		if err != nil {
+			cm.replicationCond[peer].Wait()
+			continue
+		}
+
+		cm.recentAcks[peer] = time.Now()
+		if reply.Term > cm.currentTerm {
+			cm.becomeFollower(reply.Term)
+			return
+		}
+
+		if reply.Success {
+			newMatch := args.PrevLogIndex + len(args.Entries)
+			if newMatch > cm.matchIndex[peer] {
+				cm.matchIndex[peer] = newMatch
 			}
-
-			if reply.Success {
-				cm.matchIndex[peer] = args.PrevLogIndex + len(args.Entries)
-				cm.nextIndex[peer] = cm.matchIndex[peer] + 1
-				cm.advanceCommitIndex()
-			} else {
-				if reply.ConflictTerm != -1 {
-					lastIndexWithTerm := -1
-					for i := len(cm.log) - 1; i > 0; i-- {
-						if cm.log[i].Term == reply.ConflictTerm {
-							lastIndexWithTerm = i
-							break
-						}
+			cm.nextIndex[peer] = cm.matchIndex[peer] + 1
+			cm.advanceCommitIndex()
+		} else {
+			if reply.ConflictTerm != -1 {
+				lastIndexWithTerm := -1
+				for i := len(cm.log) - 1; i >= 0; i-- {
+					if cm.log[i].Term == reply.ConflictTerm {
+						lastIndexWithTerm = i + cm.lastIncludedIndex
+						break
 					}
-					if lastIndexWithTerm != -1 {
-						cm.nextIndex[peer] = lastIndexWithTerm + 1
-					} else {
-						cm.nextIndex[peer] = reply.ConflictIndex
-					}
+				}
+				if lastIndexWithTerm != -1 {
+					cm.nextIndex[peer] = lastIndexWithTerm + 1
 				} else {
 					cm.nextIndex[peer] = reply.ConflictIndex
 				}
-
-				if cm.nextIndex[peer] < 1 {
-					cm.nextIndex[peer] = 1
-				}
+			} else {
+				cm.nextIndex[peer] = reply.ConflictIndex
 			}
-		}(peerId)
+			if cm.nextIndex[peer] < 1 {
+				cm.nextIndex[peer] = 1
+			}
+		}
+
+		if cm.nextIndex[peer] > (cm.lastIncludedIndex + len(cm.log) - 1) {
+			cm.replicationCond[peer].Wait()
+		}
 	}
 }
 
 func (cm *ConsensusModule) advanceCommitIndex() {
-	for i := cm.lastIncludedIndex + len(cm.log) - 1; i > cm.commitIndex; i-- {
+	for i := cm.lastIncludedIndex + len(cm.log) - 1; i > int(cm.commitIndex.Load()); i-- {
+		if i > cm.persistedIndex {
+			continue
+		}
 		if cm.log[i-cm.lastIncludedIndex].Term != cm.currentTerm {
 			continue
 		}
@@ -169,8 +175,7 @@ func (cm *ConsensusModule) advanceCommitIndex() {
 		}
 
 		if matchCount*2 > len(cm.peerIds)+1 {
-			cm.commitIndex = i
-			cm.dlog("Advanced CommitIndex to %d", cm.commitIndex)
+			cm.commitIndex.Store(int64(i))
 			cm.applyCond.Broadcast()
 			return
 		}

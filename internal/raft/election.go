@@ -7,6 +7,10 @@ import (
 
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.randomTimeout()
+	cm.mu.Lock()
+	lastSeen := cm.lastElectionReset
+	cm.mu.Unlock()
+
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -18,8 +22,17 @@ func (cm *ConsensusModule) runElectionTimer() {
 			cm.mu.Unlock()
 			continue
 		}
-		if time.Since(cm.lastElectionReset) >= timeoutDuration {
+
+		if cm.lastElectionReset != lastSeen {
+			lastSeen = cm.lastElectionReset
+			timeoutDuration = cm.randomTimeout()
+			cm.mu.Unlock()
+			continue
+		}
+
+		if time.Since(lastSeen) >= timeoutDuration {
 			cm.startElection()
+			lastSeen = cm.lastElectionReset
 			timeoutDuration = cm.randomTimeout()
 		}
 
@@ -34,9 +47,9 @@ func (cm *ConsensusModule) startElection() {
 	cm.votedFor = cm.id
 	cm.leaderId = -1
 	cm.lastElectionReset = time.Now()
-	cm.persistToStorage()
+	cm.persistMeta()
 
-	cm.dlog("Starting election")
+	cm.dlog("Starting election for term %d", savedCurrentTerm)
 	votesReceived := 1
 
 	args := RequestVoteArgs{
@@ -49,7 +62,6 @@ func (cm *ConsensusModule) startElection() {
 	for _, peerId := range cm.peerIds {
 		go func(peer int) {
 			var reply RequestVoteReply
-
 			if err := cm.server.SendRequestVote(peer, args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -58,18 +70,13 @@ func (cm *ConsensusModule) startElection() {
 					return
 				}
 				if reply.Term > savedCurrentTerm {
-					cm.dlog("Term mismatch in RequestVote response. Stepping down to Follower")
-					cm.currentTerm = reply.Term
-					cm.votedFor = -1
-					cm.state = Follower
+					cm.becomeFollower(reply.Term)
 					return
 				}
 				if reply.VoteGranted {
 					votesReceived++
-					cm.dlog("Received vote from %d. Total: %d", peer, votesReceived)
 					if votesReceived*2 > len(cm.peerIds)+1 {
 						cm.startLeader()
-						return
 					}
 				}
 			}
@@ -78,5 +85,5 @@ func (cm *ConsensusModule) startElection() {
 }
 
 func (cm *ConsensusModule) randomTimeout() time.Duration {
-	return time.Duration(300+rand.Intn(300)) * time.Millisecond
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }

@@ -4,11 +4,12 @@ import (
 	"bytes"
 	"encoding/gob"
 	"sync"
+
 	"github.com/ayushk-1801/raft-kv/internal/raft"
 )
 
 type Op struct {
-	Operation string 
+	Operation string
 	Key       string
 	Value     string
 }
@@ -19,7 +20,7 @@ type KVStore struct {
 
 	applyCh <-chan raft.ApplyMsg
 	node    *raft.ConsensusModule
-	
+
 	lastApplied int
 	applyCond   *sync.Cond
 }
@@ -56,7 +57,7 @@ func (kv *KVStore) RestoreFromSnapshot(data []byte) {
 func (kv *KVStore) readApplyCh() {
 	for msg := range kv.applyCh {
 		if !msg.CommandValid {
-			if msg.Command == "SNAPSHOT" {
+			if len(msg.Data) > 0 {
 				kv.RestoreFromSnapshot(msg.Data)
 				kv.mu.Lock()
 				kv.lastApplied = msg.CommandIndex
@@ -75,11 +76,11 @@ func (kv *KVStore) readApplyCh() {
 			case "DELETE":
 				delete(kv.db, op.Key)
 			}
-			
+
 			kv.lastApplied = msg.CommandIndex
 			kv.applyCond.Broadcast()
 
-			if msg.CommandIndex % 100 == 0 {
+			if msg.CommandIndex%100 == 0 {
 				data := kv.Snapshot()
 				go kv.node.Snapshot(msg.CommandIndex, data)
 			}

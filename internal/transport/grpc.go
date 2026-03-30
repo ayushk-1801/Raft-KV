@@ -59,10 +59,10 @@ func (gt *GrpcTransport) SendRequestVote(peerId int, args raft.RequestVoteArgs, 
 	}
 
 	pbArgs := &raftpb.RequestVoteArgs{
-		Term:         int32(args.Term),
+		Term:         int64(args.Term),
 		CandidateId:  int32(args.CandidateID),
-		LastLogIndex: int32(args.LastLogIndex),
-		LastLogTerm:  int32(args.LastLogTerm),
+		LastLogIndex: int64(args.LastLogIndex),
+		LastLogTerm:  int64(args.LastLogTerm),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -85,25 +85,28 @@ func (gt *GrpcTransport) SendAppendEntries(peerId int, args raft.AppendEntriesAr
 	}
 
 	pbEntries := make([]*raftpb.LogEntry, len(args.Entries))
+	var buf bytes.Buffer
 	for i, entry := range args.Entries {
-		var buf bytes.Buffer
+		buf.Reset()
 		enc := gob.NewEncoder(&buf)
-		if err := enc.Encode(entry.Command); err != nil {
+		if err := enc.Encode(&entry.Command); err != nil {
 			return err
 		}
+		cmdBytes := make([]byte, buf.Len())
+		copy(cmdBytes, buf.Bytes())
 		pbEntries[i] = &raftpb.LogEntry{
-			Term:    int32(entry.Term),
-			Command: buf.Bytes(),
+			Term:    int64(entry.Term),
+			Command: cmdBytes,
 		}
 	}
 
 	pbArgs := &raftpb.AppendEntriesArgs{
-		Term:         int32(args.Term),
+		Term:         int64(args.Term),
 		LeaderId:     int32(args.LeaderID),
-		PrevLogIndex: int32(args.PrevLogIndex),
-		PrevLogTerm:  int32(args.PrevLogTerm),
+		PrevLogIndex: int64(args.PrevLogIndex),
+		PrevLogTerm:  int64(args.PrevLogTerm),
 		Entries:      pbEntries,
-		LeaderCommit: int32(args.LeaderCommit),
+		LeaderCommit: int64(args.LeaderCommit),
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -128,10 +131,10 @@ func (gt *GrpcTransport) SendInstallSnapshot(peerId int, args raft.InstallSnapsh
 	}
 
 	pbArgs := &raftpb.InstallSnapshotArgs{
-		Term:              int32(args.Term),
+		Term:              int64(args.Term),
 		LeaderId:          int32(args.LeaderId),
-		LastIncludedIndex: int32(args.LastIncludedIndex),
-		LastIncludedTerm:  int32(args.LastIncludedTerm),
+		LastIncludedIndex: int64(args.LastIncludedIndex),
+		LastIncludedTerm:  int64(args.LastIncludedTerm),
 		Data:              args.Data,
 	}
 
@@ -160,7 +163,7 @@ func (gt *GrpcTransport) RequestVote(ctx context.Context, args *raftpb.RequestVo
 		return nil, err
 	}
 	return &raftpb.RequestVoteReply{
-		Term:        int32(raftReply.Term),
+		Term:        int64(raftReply.Term),
 		VoteGranted: raftReply.VoteGranted,
 	}, nil
 }
@@ -169,7 +172,7 @@ func (gt *GrpcTransport) AppendEntries(ctx context.Context, args *raftpb.AppendE
 	raftEntries := make([]raft.LogEntry, len(args.Entries))
 	for i, entry := range args.Entries {
 		var command interface{}
-		dec := gob.NewDecoder(bytes.NewBuffer(entry.Command))
+		dec := gob.NewDecoder(bytes.NewReader(entry.Command))
 		if err := dec.Decode(&command); err != nil {
 			return nil, err
 		}
@@ -193,10 +196,10 @@ func (gt *GrpcTransport) AppendEntries(ctx context.Context, args *raftpb.AppendE
 		return nil, err
 	}
 	return &raftpb.AppendEntriesReply{
-		Term:          int32(raftReply.Term),
+		Term:          int64(raftReply.Term),
 		Success:       raftReply.Success,
-		ConflictIndex: int32(raftReply.ConflictIndex),
-		ConflictTerm:  int32(raftReply.ConflictTerm),
+		ConflictIndex: int64(raftReply.ConflictIndex),
+		ConflictTerm:  int64(raftReply.ConflictTerm),
 	}, nil
 }
 
@@ -214,7 +217,7 @@ func (gt *GrpcTransport) InstallSnapshot(ctx context.Context, args *raftpb.Insta
 		return nil, err
 	}
 	return &raftpb.InstallSnapshotReply{
-		Term: int32(raftReply.Term),
+		Term: int64(raftReply.Term),
 	}, nil
 }
 

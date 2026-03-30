@@ -22,26 +22,59 @@ import (
 type DiskStorage struct {
 	mu     sync.Mutex
 	nodeID int
+	wal    *raft.WAL
 }
 
 func NewDiskStorage(nodeID int) *DiskStorage {
-	return &DiskStorage{nodeID: nodeID}
+	wal, err := raft.NewWAL(fmt.Sprintf("node_%d_raft_wal.bin", nodeID))
+	if err != nil {
+		panic(err)
+	}
+	return &DiskStorage{nodeID: nodeID, wal: wal}
 }
 
 func (d *DiskStorage) getFilename(k string) string {
 	return fmt.Sprintf("node_%d_%s.bin", d.nodeID, k)
 }
 
-func (d *DiskStorage) Set(k string, v []byte) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return os.WriteFile(d.getFilename(k), v, 0644)
+func (d *DiskStorage) AppendLog(entry []byte) error {
+	return d.wal.AppendLog(entry)
 }
 
-func (d *DiskStorage) Get(k string) ([]byte, error) {
+func (d *DiskStorage) Sync() error {
+	return d.wal.Sync()
+}
+
+func (d *DiskStorage) ReadLogRange(start, end int) ([][]byte, error) {
+	return d.wal.ReadLogRange(start, end)
+}
+
+func (d *DiskStorage) SaveSnapshot(meta []byte, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return os.ReadFile(d.getFilename(k))
+	if err := os.WriteFile(d.getFilename("raft_snapshot"), data, 0644); err != nil {
+		return err
+	}
+	return os.WriteFile(d.getFilename("raft_state"), meta, 0644)
+}
+
+func (d *DiskStorage) SaveMeta(meta []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return os.WriteFile(d.getFilename("raft_state"), meta, 0644)
+}
+
+func (d *DiskStorage) ClearLog() error {
+	return d.wal.ClearLog()
+}
+
+func (d *DiskStorage) ReadState() (meta []byte, snap []byte, logs [][]byte, err error) {
+	d.mu.Lock()
+	meta, _ = os.ReadFile(d.getFilename("raft_state"))
+	snap, _ = os.ReadFile(d.getFilename("raft_snapshot"))
+	d.mu.Unlock()
+	logs, err = d.wal.Load()
+	return
 }
 
 func (d *DiskStorage) HasData() bool {
@@ -88,6 +121,11 @@ func (s *HTTPServer) handleKV(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
+		if err := s.node.LinearizableRead(); err != nil {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+
 		val, ok := s.kv.Get(key)
 		if !ok {
 			http.Error(w, "Key not found", http.StatusNotFound)
@@ -136,7 +174,6 @@ func main() {
 	flag.Parse()
 
 	if *id == -1 || *port == "" {
-		fmt.Println("Usage: go run main.go -id <id> -port <port> [-rpc-port <port>] [-transport rpc|grpc] [-peers <id:host:port>,...]")
 		os.Exit(1)
 	}
 
@@ -155,28 +192,24 @@ func main() {
 		}
 	}
 
-	var transporter raft.Transporter
 	var grpcTransporter *transport.GrpcTransport
+	var raftTransporter raft.Transporter
 
 	if *transportType == "grpc" {
 		grpcTransporter = transport.NewGrpcTransport(peerAddresses)
-		transporter = grpcTransporter
+		raftTransporter = grpcTransporter
 	} else {
-		transporter = transport.NewNetworkTransport(peerAddresses)
+		raftTransporter = transport.NewNetworkTransport(peerAddresses)
 	}
 
 	storage := NewDiskStorage(*id)
 	applyCh := make(chan raft.ApplyMsg, 100)
-
-	cm := raft.NewConsensusModule(*id, peerIds, transporter, storage, applyCh)
+	cm := raft.NewConsensusModule(*id, peerIds, raftTransporter, storage, applyCh)
 	kv := store.NewKVStore(applyCh, cm)
 
 	if *transportType == "grpc" {
 		grpcTransporter.SetCM(cm)
-		lis, err := net.Listen("tcp", ":"+*rpcPort)
-		if err != nil {
-			log.Fatalf("failed to listen: %v", err)
-		}
+		lis, _ := net.Listen("tcp", ":"+*rpcPort)
 		go grpcTransporter.Serve(lis)
 	} else {
 		rpcProxy := transport.NewRPCProxy(cm)
@@ -185,16 +218,8 @@ func main() {
 		rpcServer.HandleHTTP(rpc.DefaultRPCPath, rpc.DefaultDebugPath)
 	}
 
-	httpServer := &HTTPServer{
-		node:          cm,
-		kv:            kv,
-		port:          *port,
-		id:            *id,
-		peerAddresses: peerAddresses,
-	}
+	httpServer := &HTTPServer{node: cm, kv: kv, port: *port, id: *id, peerAddresses: peerAddresses}
 	http.HandleFunc("/kv/", httpServer.handleKV)
 	http.HandleFunc("/stats", httpServer.handleStats)
-
-	fmt.Printf("Node %d booting. HTTP on %s, RPC on %s (%s). Peers: %v\n", *id, *port, *rpcPort, *transportType, peerIds)
 	log.Fatal(http.ListenAndServe(":"+*port, nil))
 }

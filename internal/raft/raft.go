@@ -25,9 +25,14 @@ type Transporter interface {
 }
 
 type Storage interface {
-	Set(key string, value []byte) error
-	Get(key string) ([]byte, error)
+	AppendLog(entry []byte) error
+	Sync() error
+	ReadLogRange(start, end int) ([][]byte, error)
+	SaveSnapshot(metadata, data []byte) error
+	SaveMeta(meta []byte) error
+	ClearLog() error
 	HasData() bool
+	ReadState() (meta []byte, snap []byte, logs [][]byte, err error)
 }
 
 type Snapshot struct {
@@ -36,10 +41,9 @@ type Snapshot struct {
 	Data              []byte
 }
 
-type persistentState struct {
+type persistentMeta struct {
 	CurrentTerm       int
 	VotedFor          int
-	Log               []LogEntry
 	LastIncludedIndex int
 	LastIncludedTerm  int
 }
@@ -55,11 +59,12 @@ type ApplyMsg struct {
 type ConsensusModule struct {
 	mu sync.Mutex
 
-	id        int
-	peerIds   []int
-	server    Transporter
-	storage   Storage
-	applyCh   chan ApplyMsg
+	id      int
+	peerIds []int
+	server  Transporter
+	storage Storage
+	applyCh chan ApplyMsg
+
 	applyCond *sync.Cond
 	state     State
 
@@ -68,18 +73,33 @@ type ConsensusModule struct {
 	log               []LogEntry
 	lastElectionReset time.Time
 
-	commitIndex int
-	lastApplied int
+	commitIndex atomic.Int64
+	lastApplied atomic.Int64
 
 	nextIndex  map[int]int
 	matchIndex map[int]int
 
+	replicationCond map[int]*sync.Cond
+
+	// WAL persistence state
+	persistedIndex int
+	persistCond    *sync.Cond
+	syncCond       *sync.Cond
+	walTruncated   bool
+
+	// Lease-based read state
+	recentAcks map[int]time.Time
+
 	dead                int32
 	electionTimerPaused bool
 	leaderId            int
+	triggerCh           chan struct{}
 
 	lastIncludedIndex int
 	lastIncludedTerm  int
+
+	// Pending snapshot for ordered delivery in applier
+	pendingSnapshot *ApplyMsg
 }
 
 type RaftStats struct {
@@ -122,8 +142,8 @@ func (cm *ConsensusModule) GetStats() RaftStats {
 		ID:                cm.id,
 		Term:              cm.currentTerm,
 		State:             stateStr,
-		CommitIndex:       cm.commitIndex,
-		LastApplied:       cm.lastApplied,
+		CommitIndex:       int(cm.commitIndex.Load()),
+		LastApplied:       int(cm.lastApplied.Load()),
 		LogLen:            cm.lastIncludedIndex + len(cm.log),
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
@@ -135,6 +155,14 @@ func (cm *ConsensusModule) GetStats() RaftStats {
 
 func (cm *ConsensusModule) Kill() {
 	atomic.StoreInt32(&cm.dead, 1)
+	cm.mu.Lock()
+	cm.applyCond.Broadcast()
+	cm.persistCond.Broadcast()
+	cm.syncCond.Broadcast()
+	for _, cond := range cm.replicationCond {
+		cond.Broadcast()
+	}
+	cm.mu.Unlock()
 }
 
 func (cm *ConsensusModule) isKilled() bool {
@@ -156,26 +184,48 @@ func (cm *ConsensusModule) GetState() (int, int, bool, int) {
 	return cm.id, cm.currentTerm, cm.state == Leader, cm.leaderId
 }
 
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.state = Follower
+	cm.currentTerm = term
+	cm.votedFor = -1
+	cm.leaderId = -1
+	cm.persistMeta()
+	for _, cond := range cm.replicationCond {
+		cond.Broadcast()
+	}
+}
+
 func (cm *ConsensusModule) Snapshot(index int, snapshot []byte) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	if index <= cm.lastIncludedIndex || index > cm.lastApplied {
+	if index <= cm.lastIncludedIndex || index > int(cm.lastApplied.Load()) {
 		return
 	}
 
 	cm.dlog("Snapshotting at index %d", index)
-	
-	newLog := make([]LogEntry, 0)
-	newLog = append(newLog, LogEntry{Term: cm.log[index-cm.lastIncludedIndex].Term})
-	newLog = append(newLog, cm.log[index-cm.lastIncludedIndex+1:]...)
 
-	cm.lastIncludedTerm = cm.log[index-cm.lastIncludedIndex].Term
+	offset := index - cm.lastIncludedIndex
+	newLog := make([]LogEntry, 1+len(cm.log)-offset-1)
+	newLog[0] = LogEntry{Term: cm.log[offset].Term}
+	copy(newLog[1:], cm.log[offset+1:])
+
+	cm.lastIncludedTerm = newLog[0].Term
 	cm.lastIncludedIndex = index
 	cm.log = newLog
 
-	cm.persistToStorage()
-	cm.storage.Set("raft_snapshot", snapshot)
+	cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
+	cm.walTruncated = true
+
+	meta := persistentMeta{
+		CurrentTerm:       cm.currentTerm,
+		VotedFor:          cm.votedFor,
+		LastIncludedIndex: cm.lastIncludedIndex,
+		LastIncludedTerm:  cm.lastIncludedTerm,
+	}
+	// Write snapshot before metadata to ensure recovery safety.
+	cm.storage.SaveSnapshot(encodeMeta(meta), snapshot)
+	cm.persistCond.Broadcast()
 }
 
 func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
@@ -187,11 +237,8 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 		return nil
 	}
 
-	if args.Term > cm.currentTerm {
-		cm.currentTerm = args.Term
-		cm.votedFor = -1
-		cm.state = Follower
-		cm.persistToStorage()
+	if args.Term > cm.currentTerm || cm.state != Follower {
+		cm.becomeFollower(args.Term)
 	}
 
 	cm.leaderId = args.LeaderId
@@ -201,35 +248,56 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 		return nil
 	}
 
-	if args.LastIncludedIndex < cm.lastIncludedIndex+len(cm.log) && 
-	   cm.log[args.LastIncludedIndex-cm.lastIncludedIndex].Term == args.LastIncludedTerm {
-		cm.log = append([]LogEntry{{Term: args.LastIncludedTerm}}, cm.log[args.LastIncludedIndex-cm.lastIncludedIndex+1:]...)
+	if args.LastIncludedIndex < cm.lastIncludedIndex+len(cm.log) &&
+		cm.log[args.LastIncludedIndex-cm.lastIncludedIndex].Term == args.LastIncludedTerm {
+		offset := args.LastIncludedIndex - cm.lastIncludedIndex
+		newLog := make([]LogEntry, 1+len(cm.log)-offset-1)
+		newLog[0] = LogEntry{Term: args.LastIncludedTerm}
+		copy(newLog[1:], cm.log[offset+1:])
+		cm.log = newLog
 	} else {
 		cm.log = []LogEntry{{Term: args.LastIncludedTerm}}
 	}
 
 	cm.lastIncludedIndex = args.LastIncludedIndex
 	cm.lastIncludedTerm = args.LastIncludedTerm
-	
-	cm.commitIndex = max(cm.commitIndex, args.LastIncludedIndex)
-	cm.lastApplied = max(cm.lastApplied, args.LastIncludedIndex)
 
-	cm.persistToStorage()
-	cm.storage.Set("raft_snapshot", args.Data)
+	if int(cm.commitIndex.Load()) < args.LastIncludedIndex {
+		cm.commitIndex.Store(int64(args.LastIncludedIndex))
+	}
+	if int(cm.lastApplied.Load()) < args.LastIncludedIndex {
+		cm.lastApplied.Store(int64(args.LastIncludedIndex))
+	}
+	cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
 
-	msg := ApplyMsg{
+	cm.walTruncated = true
+	meta := persistentMeta{
+		CurrentTerm:       cm.currentTerm,
+		VotedFor:          cm.votedFor,
+		LastIncludedIndex: cm.lastIncludedIndex,
+		LastIncludedTerm:  cm.lastIncludedTerm,
+	}
+	cm.storage.SaveSnapshot(encodeMeta(meta), args.Data)
+
+	cm.pendingSnapshot = &ApplyMsg{
 		CommandValid: false,
-		Command:      "SNAPSHOT",
 		Data:         args.Data,
 		CommandIndex: args.LastIncludedIndex,
 		CommandTerm:  args.LastIncludedTerm,
 	}
-	
-	go func() {
-		cm.applyCh <- msg
-	}()
+	cm.applyCond.Broadcast()
 
 	return nil
+}
+
+func (cm *ConsensusModule) GetApplyCh() <-chan ApplyMsg {
+	return cm.applyCh
+}
+
+func (cm *ConsensusModule) GetInternalState() (int, int, []LogEntry) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return int(cm.commitIndex.Load()), int(cm.lastApplied.Load()), append([]LogEntry(nil), cm.log...)
 }
 
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
@@ -249,54 +317,169 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 
 func NewConsensusModule(id int, peerIds []int, server Transporter, storage Storage, applyCh chan ApplyMsg) *ConsensusModule {
 	cm := &ConsensusModule{
-		id:          id,
-		peerIds:     peerIds,
-		server:      server,
-		storage:     storage,
-		applyCh:     applyCh,
-		state:       Follower,
-		currentTerm: 0,
-		votedFor:    -1,
-		log:         make([]LogEntry, 1),
-		commitIndex: 0,
-		lastApplied: 0,
-		nextIndex:   make(map[int]int),
-		matchIndex:  make(map[int]int),
-		leaderId:    -1,
+		id:                id,
+		peerIds:           peerIds,
+		server:            server,
+		storage:           storage,
+		applyCh:           applyCh,
+		state:             Follower,
+		currentTerm:       0,
+		votedFor:          -1,
+		log:               make([]LogEntry, 1),
+		nextIndex:         make(map[int]int),
+		matchIndex:        make(map[int]int),
+		leaderId:          -1,
+		triggerCh:         make(chan struct{}, 1),
+		replicationCond:   make(map[int]*sync.Cond),
+		persistedIndex:    0,
+		lastElectionReset: time.Now(),
+		recentAcks:        make(map[int]time.Time),
 	}
 	cm.applyCond = sync.NewCond(&cm.mu)
+	cm.persistCond = sync.NewCond(&cm.mu)
+	cm.syncCond = sync.NewCond(&cm.mu)
+	for _, peerId := range peerIds {
+		cm.replicationCond[peerId] = sync.NewCond(&cm.mu)
+	}
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
-		cm.commitIndex = cm.lastIncludedIndex
-		cm.lastApplied = cm.lastIncludedIndex
-		
-		if cm.lastIncludedIndex > 0 {
-			snapshotData, err := cm.storage.Get("raft_snapshot")
-			if err == nil {
-				msg := ApplyMsg{
-					CommandValid: false,
-					Command:      "SNAPSHOT",
-					Data:         snapshotData,
-					CommandIndex: cm.lastIncludedIndex,
-					CommandTerm:  cm.lastIncludedTerm,
-				}
-				go func() {
-					cm.applyCh <- msg
-				}()
-			}
-		}
+		cm.commitIndex.Store(int64(cm.lastIncludedIndex))
+		cm.lastApplied.Store(int64(cm.lastIncludedIndex))
+		cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
 	} else {
 		cm.currentTerm = 0
 		cm.votedFor = -1
-		cm.log = make([]LogEntry, 1)
-		cm.log[0] = LogEntry{Term: 0}
+		cm.log = []LogEntry{{Term: 0}}
 		cm.lastIncludedIndex = 0
 		cm.lastIncludedTerm = 0
 	}
-	
+
 	go cm.runElectionTimer()
 	go cm.applier()
+	go cm.persister()
 	return cm
+}
+
+func (cm *ConsensusModule) persister() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	for !cm.isKilled() {
+		lastLogIndex := cm.lastIncludedIndex + len(cm.log) - 1
+		if cm.persistedIndex >= lastLogIndex && !cm.walTruncated {
+			cm.persistCond.Wait()
+			continue
+		}
+
+		truncated := cm.walTruncated
+		cm.walTruncated = false
+
+		var walEntries []LogEntry
+		var targetIndex int
+
+		if truncated {
+			walEntries = make([]LogEntry, len(cm.log)-1)
+			copy(walEntries, cm.log[1:])
+			targetIndex = lastLogIndex
+		} else {
+			fromIdx := cm.persistedIndex + 1
+			toIdx := lastLogIndex
+			numNew := toIdx - fromIdx + 1
+			walEntries = make([]LogEntry, numNew)
+			for i := 0; i < numNew; i++ {
+				localIdx := (fromIdx + i) - cm.lastIncludedIndex
+				walEntries[i] = cm.log[localIdx]
+			}
+			targetIndex = toIdx
+		}
+
+		meta := persistentMeta{
+			CurrentTerm:       cm.currentTerm,
+			VotedFor:          cm.votedFor,
+			LastIncludedIndex: cm.lastIncludedIndex,
+			LastIncludedTerm:  cm.lastIncludedTerm,
+		}
+
+		cm.mu.Unlock()
+
+		cm.storage.SaveMeta(encodeMeta(meta))
+		if truncated {
+			cm.storage.ClearLog()
+		}
+
+		for _, entry := range walEntries {
+			var cmdBuf bytes.Buffer
+			enc := gob.NewEncoder(&cmdBuf)
+			if err := enc.Encode(&entry); err == nil {
+				cm.storage.AppendLog(cmdBuf.Bytes())
+			}
+		}
+		cm.storage.Sync()
+
+		cm.mu.Lock()
+		if targetIndex > cm.persistedIndex {
+			cm.persistedIndex = targetIndex
+		}
+		cm.syncCond.Broadcast()
+
+		if cm.state == Leader {
+			cm.advanceCommitIndex()
+		}
+	}
+}
+
+func encodeMeta(meta persistentMeta) []byte {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(meta); err != nil {
+		panic("encodeMeta: " + err.Error())
+	}
+	return buf.Bytes()
+}
+
+func (cm *ConsensusModule) persistMeta() {
+	meta := persistentMeta{
+		CurrentTerm:       cm.currentTerm,
+		VotedFor:          cm.votedFor,
+		LastIncludedIndex: cm.lastIncludedIndex,
+		LastIncludedTerm:  cm.lastIncludedTerm,
+	}
+	cm.storage.SaveMeta(encodeMeta(meta))
+}
+
+func (cm *ConsensusModule) restoreFromStorage() {
+	metaData, snapData, logsData, err := cm.storage.ReadState()
+	if err != nil {
+		panic("restoreFromStorage: " + err.Error())
+	}
+
+	if len(metaData) > 0 {
+		var meta persistentMeta
+		dec := gob.NewDecoder(bytes.NewBuffer(metaData))
+		if err := dec.Decode(&meta); err == nil {
+			cm.currentTerm = meta.CurrentTerm
+			cm.votedFor = meta.VotedFor
+			cm.lastIncludedIndex = meta.LastIncludedIndex
+			cm.lastIncludedTerm = meta.LastIncludedTerm
+		}
+	}
+
+	cm.log = []LogEntry{{Term: cm.lastIncludedTerm}}
+	for _, logBytes := range logsData {
+		var entry LogEntry
+		if err := gob.NewDecoder(bytes.NewReader(logBytes)).Decode(&entry); err == nil {
+			cm.log = append(cm.log, entry)
+		}
+	}
+
+	if len(snapData) > 0 {
+		cm.pendingSnapshot = &ApplyMsg{
+			CommandValid: false,
+			Data:         snapData,
+			CommandIndex: cm.lastIncludedIndex,
+			CommandTerm:  cm.lastIncludedTerm,
+		}
+	}
 }
 
 func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
@@ -304,11 +487,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	defer cm.mu.Unlock()
 
 	if args.Term > cm.currentTerm {
-		cm.dlog("Term mismatch. Stepping down to Follower")
-		cm.currentTerm = args.Term
-		cm.votedFor = -1
-		cm.state = Follower
-		cm.persistToStorage()
+		cm.becomeFollower(args.Term)
 	}
 
 	reply.Term = cm.currentTerm
@@ -327,7 +506,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 		reply.VoteGranted = true
 		cm.votedFor = args.CandidateID
 		cm.lastElectionReset = time.Now()
-		cm.persistToStorage()
+		cm.persistMeta()
 	}
 
 	return nil
@@ -337,6 +516,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	reply.ConflictTerm = -1
+
 	if args.Term < cm.currentTerm {
 		reply.Term = cm.currentTerm
 		reply.Success = false
@@ -344,11 +525,7 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	if args.Term > cm.currentTerm || cm.state == Candidate {
-		cm.dlog("Stepping down to Follower (term %d)", args.Term)
-		cm.currentTerm = args.Term
-		cm.state = Follower
-		cm.votedFor = -1
-		cm.persistToStorage()
+		cm.becomeFollower(args.Term)
 	}
 
 	cm.leaderId = args.LeaderID
@@ -369,11 +546,13 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	if cm.log[args.PrevLogIndex-cm.lastIncludedIndex].Term != args.PrevLogTerm {
-		reply.ConflictTerm = cm.log[args.PrevLogIndex-cm.lastIncludedIndex].Term
-		var i int
-		for i = args.PrevLogIndex; i > cm.lastIncludedIndex && cm.log[i-cm.lastIncludedIndex].Term == reply.ConflictTerm; i-- {
+		conflictTerm := cm.log[args.PrevLogIndex-cm.lastIncludedIndex].Term
+		reply.ConflictTerm = conflictTerm
+		firstIdx := args.PrevLogIndex
+		for firstIdx > cm.lastIncludedIndex && cm.log[firstIdx-cm.lastIncludedIndex].Term == conflictTerm {
+			firstIdx--
 		}
-		reply.ConflictIndex = i + 1
+		reply.ConflictIndex = firstIdx + 1
 		return nil
 	}
 
@@ -393,13 +572,28 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 
 	if newEntriesIndex < len(args.Entries) {
 		cm.log = append(cm.log[:insertIndex-cm.lastIncludedIndex], args.Entries[newEntriesIndex:]...)
-		cm.persistToStorage()
+		if insertIndex-1 < cm.persistedIndex {
+			cm.persistedIndex = insertIndex - 1
+			cm.walTruncated = true
+		}
+		cm.persistCond.Broadcast()
 	}
 
-	if args.LeaderCommit > cm.commitIndex {
+	// Wait for durability before acknowledging success.
+	if len(args.Entries) > 0 {
+		targetIndex := args.PrevLogIndex + len(args.Entries)
+		for cm.persistedIndex < targetIndex && !cm.isKilled() {
+			cm.syncCond.Wait()
+		}
+		if cm.isKilled() {
+			return nil
+		}
+	}
+
+	if args.LeaderCommit > int(cm.commitIndex.Load()) {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
-		cm.commitIndex = min(args.LeaderCommit, lastNewEntryIndex)
-		cm.applyCond.Broadcast() 
+		cm.commitIndex.Store(int64(min(args.LeaderCommit, lastNewEntryIndex)))
+		cm.applyCond.Broadcast()
 	}
 
 	reply.Success = true
@@ -422,44 +616,13 @@ func (cm *ConsensusModule) Submit(command interface{}) (int, int, bool) {
 		Command: command,
 	})
 
-	cm.persistToStorage()
+	cm.persistCond.Broadcast()
+	select {
+	case cm.triggerCh <- struct{}{}:
+	default:
+	}
+
 	return index, term, true
-}
-
-func (cm *ConsensusModule) persistToStorage() {
-	state := persistentState{
-		CurrentTerm:       cm.currentTerm,
-		VotedFor:          cm.votedFor,
-		Log:               cm.log,
-		LastIncludedIndex: cm.lastIncludedIndex,
-		LastIncludedTerm:  cm.lastIncludedTerm,
-	}
-
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(state); err != nil {
-		panic("Encode error: " + err.Error())
-	}
-	cm.storage.Set("raft_state", buf.Bytes())
-}
-
-func (cm *ConsensusModule) restoreFromStorage() {
-	data, err := cm.storage.Get("raft_state")
-	if err != nil {
-		panic("Read error: " + err.Error())
-	}
-
-	var state persistentState
-	dec := gob.NewDecoder(bytes.NewBuffer(data))
-	if err := dec.Decode(&state); err != nil {
-		panic("Decode error: " + err.Error())
-	}
-
-	cm.currentTerm = state.CurrentTerm
-	cm.votedFor = state.VotedFor
-	cm.log = state.Log
-	cm.lastIncludedIndex = state.LastIncludedIndex
-	cm.lastIncludedTerm = state.LastIncludedTerm
 }
 
 func (cm *ConsensusModule) applier() {
@@ -467,25 +630,37 @@ func (cm *ConsensusModule) applier() {
 	defer cm.mu.Unlock()
 
 	for !cm.isKilled() {
-		for cm.lastApplied >= cm.commitIndex && !cm.isKilled() {
+		if cm.pendingSnapshot != nil {
+			snap := cm.pendingSnapshot
+			cm.pendingSnapshot = nil
+			cm.mu.Unlock()
+			cm.applyCh <- *snap
+			cm.mu.Lock()
+			continue
+		}
+
+		for int(cm.lastApplied.Load()) >= int(cm.commitIndex.Load()) && cm.pendingSnapshot == nil && !cm.isKilled() {
 			cm.applyCond.Wait()
 		}
 		if cm.isKilled() {
 			return
 		}
 
-		if cm.commitIndex <= cm.lastIncludedIndex {
-			cm.lastApplied = max(cm.lastApplied, cm.commitIndex)
+		if cm.pendingSnapshot != nil {
 			continue
 		}
 
-		commitIndex := cm.commitIndex
-		lastApplied := max(cm.lastApplied, cm.lastIncludedIndex)
+		if int(cm.commitIndex.Load()) <= cm.lastIncludedIndex {
+			cm.lastApplied.Store(int64(max(int(cm.lastApplied.Load()), cm.lastIncludedIndex)))
+			continue
+		}
+
+		commitIndex := int(cm.commitIndex.Load())
+		lastApplied := max(int(cm.lastApplied.Load()), cm.lastIncludedIndex)
 		entries := make([]LogEntry, commitIndex-lastApplied)
 		copy(entries, cm.log[lastApplied+1-cm.lastIncludedIndex:commitIndex+1-cm.lastIncludedIndex])
 
 		cm.mu.Unlock()
-
 		for i, entry := range entries {
 			cm.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -494,10 +669,32 @@ func (cm *ConsensusModule) applier() {
 				CommandTerm:  entry.Term,
 			}
 		}
-
 		cm.mu.Lock()
-		if commitIndex > cm.lastApplied {
-			cm.lastApplied = commitIndex
+		if commitIndex > int(cm.lastApplied.Load()) {
+			cm.lastApplied.Store(int64(commitIndex))
 		}
 	}
+}
+
+// LinearizableRead verifies leadership lease for consistent GET operations.
+func (cm *ConsensusModule) LinearizableRead() error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state != Leader {
+		return fmt.Errorf("not leader")
+	}
+
+	validAcks := 1 // self
+	now := time.Now()
+	for _, ackTime := range cm.recentAcks {
+		if now.Sub(ackTime) < 150*time.Millisecond {
+			validAcks++
+		}
+	}
+
+	if validAcks*2 > len(cm.peerIds)+1 {
+		return nil
+	}
+	return fmt.Errorf("leader lease expired")
 }
