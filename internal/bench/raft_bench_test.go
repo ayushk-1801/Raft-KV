@@ -192,7 +192,10 @@ func (ms *mockStorage) Sync() error                                   { return n
 func (ms *mockStorage) ReadLogRange(start, end int) ([][]byte, error) { return nil, nil }
 func (ms *mockStorage) SaveSnapshot(meta, data []byte) error          { return nil }
 func (ms *mockStorage) SaveMeta(meta []byte) error                    { return nil }
-func (ms *mockStorage) ClearLog() error                               { return nil }
+func (ms *mockStorage) ReplaceState(meta []byte, snapshot []byte, logs [][]byte) error {
+	return nil
+}
+func (ms *mockStorage) ClearLog() error { return nil }
 func (ms *mockStorage) ReadState() (meta []byte, snap []byte, logs [][]byte, err error) {
 	return nil, nil, nil, nil
 }

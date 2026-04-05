@@ -75,7 +75,7 @@ func (cm *ConsensusModule) replicator(peer int) {
 				continue
 			}
 			if reply.Term > cm.currentTerm {
-				cm.becomeFollower(reply.Term)
+				_ = cm.becomeFollower(reply.Term)
 				return
 			}
 			cm.matchIndex[peer] = max(cm.matchIndex[peer], args.LastIncludedIndex)
@@ -120,7 +120,7 @@ func (cm *ConsensusModule) replicator(peer int) {
 
 		cm.recentAcks[peer] = time.Now()
 		if reply.Term > cm.currentTerm {
-			cm.becomeFollower(reply.Term)
+			_ = cm.becomeFollower(reply.Term)
 			return
 		}
 
@@ -176,8 +176,12 @@ func (cm *ConsensusModule) advanceCommitIndex() {
 		}
 
 		if matchCount*2 > len(cm.peerIds)+1 {
+			prevCommitIndex := int(cm.commitIndex.Load())
 			cm.commitIndex.Store(int64(i))
-			cm.persistMeta()
+			if err := cm.persistMeta(); err != nil {
+				cm.commitIndex.Store(int64(prevCommitIndex))
+				return
+			}
 			cm.applyCond.Broadcast()
 			return
 		}

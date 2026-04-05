@@ -74,11 +74,17 @@ func (w *WAL) Load() ([][]byte, error) {
 			if err == io.EOF {
 				break
 			}
+			if err == io.ErrUnexpectedEOF {
+				break
+			}
 			return nil, err
 		}
 		length := binary.BigEndian.Uint32(sz[:])
 		data := make([]byte, length)
 		if _, err := io.ReadFull(w.f, data); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
 			return nil, err
 		}
 		entries = append(entries, data)

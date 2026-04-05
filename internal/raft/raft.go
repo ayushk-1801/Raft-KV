@@ -30,6 +30,7 @@ type Storage interface {
 	ReadLogRange(start, end int) ([][]byte, error)
 	SaveSnapshot(metadata, data []byte) error
 	SaveMeta(meta []byte) error
+	ReplaceState(meta []byte, snapshot []byte, logs [][]byte) error
 	ClearLog() error
 	HasData() bool
 	ReadState() (meta []byte, snap []byte, logs [][]byte, err error)
@@ -87,6 +88,8 @@ type ConsensusModule struct {
 	persistCond    *sync.Cond
 	syncCond       *sync.Cond
 	walTruncated   bool
+	snapshotData   []byte
+	persistError   error
 
 	// Lease-based read state
 	recentAcks map[int]time.Time
@@ -185,16 +188,34 @@ func (cm *ConsensusModule) GetState() (int, int, bool, int) {
 	return cm.id, cm.currentTerm, cm.state == Leader, cm.leaderId
 }
 
-func (cm *ConsensusModule) becomeFollower(term int) {
+func (cm *ConsensusModule) failLocked(err error) error {
+	if err == nil {
+		return nil
+	}
+	cm.persistError = err
+	atomic.StoreInt32(&cm.dead, 1)
+	cm.applyCond.Broadcast()
+	cm.persistCond.Broadcast()
+	cm.syncCond.Broadcast()
+	for _, cond := range cm.replicationCond {
+		cond.Broadcast()
+	}
+	return err
+}
+
+func (cm *ConsensusModule) becomeFollower(term int) error {
 	cm.state = Follower
 	cm.currentTerm = term
 	cm.votedFor = -1
 	cm.leaderId = -1
 	cm.recentAcks = make(map[int]time.Time)
-	cm.persistMeta()
+	if err := cm.persistMeta(); err != nil {
+		return err
+	}
 	for _, cond := range cm.replicationCond {
 		cond.Broadcast()
 	}
+	return nil
 }
 
 func (cm *ConsensusModule) Snapshot(index int, snapshot []byte) {
@@ -216,7 +237,6 @@ func (cm *ConsensusModule) Snapshot(index int, snapshot []byte) {
 	cm.lastIncludedIndex = index
 	cm.log = newLog
 
-	cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
 	cm.walTruncated = true
 
 	meta := persistentMeta{
@@ -226,8 +246,8 @@ func (cm *ConsensusModule) Snapshot(index int, snapshot []byte) {
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
-	// Write snapshot before metadata to ensure recovery safety.
-	cm.storage.SaveSnapshot(encodeMeta(meta), snapshot)
+	_ = meta
+	cm.snapshotData = append([]byte(nil), snapshot...)
 	cm.persistCond.Broadcast()
 }
 
@@ -241,7 +261,9 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 	}
 
 	if args.Term > cm.currentTerm || cm.state != Follower {
-		cm.becomeFollower(args.Term)
+		if err := cm.becomeFollower(args.Term); err != nil {
+			return err
+		}
 	}
 
 	cm.leaderId = args.LeaderId
@@ -271,7 +293,6 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 	if int(cm.lastApplied.Load()) < args.LastIncludedIndex {
 		cm.lastApplied.Store(int64(args.LastIncludedIndex))
 	}
-	cm.persistedIndex = cm.lastIncludedIndex + len(cm.log) - 1
 
 	cm.walTruncated = true
 	meta := persistentMeta{
@@ -281,7 +302,22 @@ func (cm *ConsensusModule) InstallSnapshot(args InstallSnapshotArgs, reply *Inst
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
-	cm.storage.SaveSnapshot(encodeMeta(meta), args.Data)
+	_ = meta
+	cm.snapshotData = append([]byte(nil), args.Data...)
+	cm.persistCond.Broadcast()
+	targetSnapshotIndex := args.LastIncludedIndex
+	for cm.persistedIndex < targetSnapshotIndex && !cm.isKilled() {
+		if cm.persistError != nil {
+			return cm.persistError
+		}
+		cm.syncCond.Wait()
+	}
+	if cm.persistError != nil {
+		return cm.persistError
+	}
+	if cm.isKilled() {
+		return fmt.Errorf("node stopped before snapshot persistence")
+	}
 
 	cm.pendingSnapshot = &ApplyMsg{
 		CommandValid: false,
@@ -376,10 +412,10 @@ func (cm *ConsensusModule) persister() {
 		}
 
 		truncated := cm.walTruncated
-		cm.walTruncated = false
 
 		var walEntries []LogEntry
 		var targetIndex int
+		snapshotData := append([]byte(nil), cm.snapshotData...)
 
 		if truncated {
 			walEntries = make([]LogEntry, len(cm.log)-1)
@@ -407,21 +443,63 @@ func (cm *ConsensusModule) persister() {
 
 		cm.mu.Unlock()
 
-		cm.storage.SaveMeta(encodeMeta(meta))
+		var persistErr error
 		if truncated {
-			cm.storage.ClearLog()
-		}
+			if snapshotData == nil {
+				_, persistedSnapshot, _, err := cm.storage.ReadState()
+				if err != nil {
+					persistErr = err
+				} else {
+					snapshotData = persistedSnapshot
+				}
+			}
+			encodedEntries := make([][]byte, 0, len(walEntries))
+			for _, entry := range walEntries {
+				var cmdBuf bytes.Buffer
+				enc := gob.NewEncoder(&cmdBuf)
+				if err := enc.Encode(&entry); err != nil {
+					persistErr = err
+					break
+				}
+				encodedEntries = append(encodedEntries, append([]byte(nil), cmdBuf.Bytes()...))
+			}
+			if persistErr == nil {
+				persistErr = cm.storage.ReplaceState(encodeMeta(meta), snapshotData, encodedEntries)
+			}
+		} else {
+			if err := cm.storage.SaveMeta(encodeMeta(meta)); err != nil {
+				persistErr = err
+			}
 
-		for _, entry := range walEntries {
-			var cmdBuf bytes.Buffer
-			enc := gob.NewEncoder(&cmdBuf)
-			if err := enc.Encode(&entry); err == nil {
-				cm.storage.AppendLog(cmdBuf.Bytes())
+			if persistErr == nil {
+				for _, entry := range walEntries {
+					var cmdBuf bytes.Buffer
+					enc := gob.NewEncoder(&cmdBuf)
+					if err := enc.Encode(&entry); err != nil {
+						persistErr = err
+						break
+					}
+					if err := cm.storage.AppendLog(cmdBuf.Bytes()); err != nil {
+						persistErr = err
+						break
+					}
+				}
+			}
+			if persistErr == nil {
+				persistErr = cm.storage.Sync()
 			}
 		}
-		cm.storage.Sync()
 
 		cm.mu.Lock()
+		if persistErr != nil {
+			_ = cm.failLocked(fmt.Errorf("persist state: %w", persistErr))
+			return
+		}
+		cm.persistError = nil
+		cm.walTruncated = false
+		if truncated {
+			cm.snapshotData = nil
+		}
 		if targetIndex > cm.persistedIndex {
 			cm.persistedIndex = targetIndex
 		}
@@ -442,7 +520,7 @@ func encodeMeta(meta persistentMeta) []byte {
 	return buf.Bytes()
 }
 
-func (cm *ConsensusModule) persistMeta() {
+func (cm *ConsensusModule) persistMeta() error {
 	meta := persistentMeta{
 		CurrentTerm:       cm.currentTerm,
 		VotedFor:          cm.votedFor,
@@ -450,7 +528,10 @@ func (cm *ConsensusModule) persistMeta() {
 		LastIncludedIndex: cm.lastIncludedIndex,
 		LastIncludedTerm:  cm.lastIncludedTerm,
 	}
-	cm.storage.SaveMeta(encodeMeta(meta))
+	if err := cm.storage.SaveMeta(encodeMeta(meta)); err != nil {
+		return cm.failLocked(fmt.Errorf("persist meta: %w", err))
+	}
+	return nil
 }
 
 func (cm *ConsensusModule) restoreFromStorage() {
@@ -493,6 +574,8 @@ func (cm *ConsensusModule) restoreFromStorage() {
 			CommandIndex: cm.lastIncludedIndex,
 			CommandTerm:  cm.lastIncludedTerm,
 		}
+	} else if cm.lastIncludedIndex > 0 {
+		panic("restoreFromStorage: missing snapshot data for compacted state")
 	}
 }
 
@@ -501,7 +584,9 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	defer cm.mu.Unlock()
 
 	if args.Term > cm.currentTerm {
-		cm.becomeFollower(args.Term)
+		if err := cm.becomeFollower(args.Term); err != nil {
+			return err
+		}
 	}
 
 	reply.Term = cm.currentTerm
@@ -517,10 +602,16 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	logIsUpToDate := args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
 	if (cm.votedFor == -1 || cm.votedFor == args.CandidateID) && logIsUpToDate {
-		reply.VoteGranted = true
+		prevVotedFor := cm.votedFor
+		prevReset := cm.lastElectionReset
 		cm.votedFor = args.CandidateID
 		cm.lastElectionReset = time.Now()
-		cm.persistMeta()
+		if err := cm.persistMeta(); err != nil {
+			cm.votedFor = prevVotedFor
+			cm.lastElectionReset = prevReset
+			return err
+		}
+		reply.VoteGranted = true
 	}
 
 	return nil
@@ -539,7 +630,9 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 
 	if args.Term > cm.currentTerm || cm.state == Candidate {
-		cm.becomeFollower(args.Term)
+		if err := cm.becomeFollower(args.Term); err != nil {
+			return err
+		}
 	}
 
 	cm.leaderId = args.LeaderID
@@ -597,17 +690,28 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	if len(args.Entries) > 0 {
 		targetIndex := args.PrevLogIndex + len(args.Entries)
 		for cm.persistedIndex < targetIndex && !cm.isKilled() {
+			if cm.persistError != nil {
+				return cm.persistError
+			}
 			cm.syncCond.Wait()
 		}
+		if cm.persistError != nil {
+			return cm.persistError
+		}
 		if cm.isKilled() {
-			return nil
+			return fmt.Errorf("node stopped before log persistence")
 		}
 	}
 
 	if args.LeaderCommit > int(cm.commitIndex.Load()) {
 		lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
-		cm.commitIndex.Store(int64(min(args.LeaderCommit, lastNewEntryIndex)))
-		cm.persistMeta()
+		newCommitIndex := min(args.LeaderCommit, lastNewEntryIndex)
+		prevCommitIndex := int(cm.commitIndex.Load())
+		cm.commitIndex.Store(int64(newCommitIndex))
+		if err := cm.persistMeta(); err != nil {
+			cm.commitIndex.Store(int64(prevCommitIndex))
+			return err
+		}
 		cm.applyCond.Broadcast()
 	}
 
@@ -619,7 +723,7 @@ func (cm *ConsensusModule) Submit(command interface{}) (int, int, bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	if cm.state != Leader {
+	if cm.state != Leader || cm.isKilled() {
 		return -1, -1, false
 	}
 

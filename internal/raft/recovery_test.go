@@ -15,6 +15,9 @@ type persistentTestStorage struct {
 	meta []byte
 	snap []byte
 	logs [][]byte
+
+	saveMetaErr     error
+	replaceStateErr error
 }
 
 func (s *persistentTestStorage) AppendLog(entry []byte) error {
@@ -61,9 +64,30 @@ func (s *persistentTestStorage) SaveSnapshot(meta, data []byte) error {
 }
 
 func (s *persistentTestStorage) SaveMeta(meta []byte) error {
+	if s.saveMetaErr != nil {
+		return s.saveMetaErr
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.meta = append([]byte(nil), meta...)
+	return nil
+}
+
+func (s *persistentTestStorage) ReplaceState(meta []byte, snapshot []byte, logs [][]byte) error {
+	if s.replaceStateErr != nil {
+		return s.replaceStateErr
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.meta = append([]byte(nil), meta...)
+	s.snap = append([]byte(nil), snapshot...)
+	s.logs = make([][]byte, 0, len(logs))
+	for _, entry := range logs {
+		copied := make([]byte, len(entry))
+		copy(copied, entry)
+		s.logs = append(s.logs, copied)
+	}
 	return nil
 }
 
@@ -178,8 +202,52 @@ func TestLeadershipTransitionsClearRecentAcks(t *testing.T) {
 	}
 
 	cm.recentAcks[2] = time.Now()
-	cm.becomeFollower(2)
+	if err := cm.becomeFollower(2); err != nil {
+		t.Fatalf("becomeFollower returned error: %v", err)
+	}
 	if len(cm.recentAcks) != 0 {
 		t.Fatalf("expected becomeFollower to clear recent acknowledgements, got %d entries", len(cm.recentAcks))
+	}
+}
+
+func TestRequestVoteFailsWhenMetaPersistenceFails(t *testing.T) {
+	storage := &persistentTestStorage{saveMetaErr: fmt.Errorf("disk full")}
+	cm := NewConsensusModule(1, nil, noopTransport{}, storage, make(chan ApplyMsg, 1))
+
+	args := RequestVoteArgs{
+		Term:         1,
+		CandidateID:  2,
+		LastLogIndex: 0,
+		LastLogTerm:  0,
+	}
+	var reply RequestVoteReply
+	err := cm.RequestVote(args, &reply)
+	if err == nil {
+		t.Fatal("expected RequestVote to fail when metadata persistence fails")
+	}
+	if !cm.isKilled() {
+		t.Fatal("expected node to stop after metadata persistence failure")
+	}
+}
+
+func TestInstallSnapshotFailsWhenSnapshotPersistenceFails(t *testing.T) {
+	storage := &persistentTestStorage{replaceStateErr: fmt.Errorf("io failure")}
+	applyCh := make(chan ApplyMsg, 1)
+	cm := NewConsensusModule(1, nil, noopTransport{}, storage, applyCh)
+
+	args := InstallSnapshotArgs{
+		Term:              1,
+		LeaderId:          2,
+		LastIncludedIndex: 1,
+		LastIncludedTerm:  1,
+		Data:              []byte("snap"),
+	}
+	var reply InstallSnapshotReply
+	err := cm.InstallSnapshot(args, &reply)
+	if err == nil {
+		t.Fatal("expected InstallSnapshot to fail when snapshot persistence fails")
+	}
+	if !cm.isKilled() {
+		t.Fatal("expected node to stop after snapshot persistence failure")
 	}
 }

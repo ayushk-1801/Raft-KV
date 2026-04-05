@@ -33,6 +33,14 @@ func (ms *MockStorage) SaveMeta(meta []byte) error {
 	ms.mu.Unlock()
 	return nil
 }
+func (ms *MockStorage) ReplaceState(meta []byte, snapshot []byte, logs [][]byte) error {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.data["raft_state"] = append([]byte(nil), meta...)
+	ms.data["raft_snapshot"] = append([]byte(nil), snapshot...)
+	delete(ms.data, "raft_logs")
+	return nil
+}
 func (ms *MockStorage) ClearLog() error { return nil }
 func (ms *MockStorage) ReadState() (meta []byte, snap []byte, logs [][]byte, err error) {
 	ms.mu.Lock()

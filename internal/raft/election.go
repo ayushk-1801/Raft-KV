@@ -47,7 +47,9 @@ func (cm *ConsensusModule) startElection() {
 	cm.votedFor = cm.id
 	cm.leaderId = -1
 	cm.lastElectionReset = time.Now()
-	cm.persistMeta()
+	if err := cm.persistMeta(); err != nil {
+		return
+	}
 
 	cm.dlog("Starting election for term %d", savedCurrentTerm)
 	votesReceived := 1
@@ -70,7 +72,7 @@ func (cm *ConsensusModule) startElection() {
 					return
 				}
 				if reply.Term > savedCurrentTerm {
-					cm.becomeFollower(reply.Term)
+					_ = cm.becomeFollower(reply.Term)
 					return
 				}
 				if reply.VoteGranted {
